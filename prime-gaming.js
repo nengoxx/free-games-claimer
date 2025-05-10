@@ -55,7 +55,7 @@ try {
       await page.fill('[name=email]', email);
       await page.click('input[type="submit"]');
       await page.fill('[name=password]', password);
-      await page.check('[name=rememberMe]');
+      // await page.check('[name=rememberMe]'); // no longer exists
       await page.click('input[type="submit"]');
       page.waitForURL('**/ap/signin**').then(async () => { // check for wrong credentials
         const error = await page.locator('.a-alert-content').first().innerText();
@@ -131,32 +131,34 @@ try {
   // bottom to top: oldest to newest games
   internal.reverse();
   external.reverse();
-  const checkTimeLeft = async url => {
-    // console.log('  Checking time left for game:', url);
-    const check = async p => {
-      console.log(' ', await p.locator('.availability-date').innerText());
-      const dueDateOrg = await p.locator('.availability-date .tw-bold').innerText();
-      const dueDate = datetime(new Date(Date.parse(dueDateOrg + ' 17:00')));
-      console.log('  Due date:', dueDate);
-    };
-    if (page.url() == url) {
-      await check(page);
-    } else {
-      const p = await context.newPage();
+  const sameOrNewPage = async url => new Promise(async (resolve, _reject) => {
+    const isNew = page.url() != url;
+    let p = page;
+    if (isNew) {
+      p = await context.newPage();
       await p.goto(url, { waitUntil: 'domcontentloaded' });
-      await check(p);
-      p.close();
     }
-  };
-  console.log('Number of free unclaimed games (Prime Gaming):', internal.length);
+    resolve([p, isNew]);
+  });
+  const skipBasedOnTime = async url => {
+    // console.log('  Checking time left for game:', url);
+    const [p, isNew] = await sameOrNewPage(url);
+    const dueDateOrg = await p.locator('.availability-date .tw-bold').innerText();
+    const dueDate = new Date(Date.parse(dueDateOrg + ' 17:00'));
+    const daysLeft = (dueDate.getTime() - Date.now())/1000/60/60/24;
+    console.log(' ', await p.locator('.availability-date').innerText(), '->', daysLeft.toFixed(2));
+    if (isNew) await p.close();
+    return daysLeft > cfg.pg_timeLeft;
+  }
+  console.log('\nNumber of free unclaimed games (Prime Gaming):', internal.length);
   // claim games in internal store
   for (const card of internal) {
     await card.scrollIntoViewIfNeeded();
     const title = await (await card.$('.item-card-details__body__primary')).innerText();
     const slug = await (await card.$('a')).getAttribute('href');
     const url = 'https://gaming.amazon.com' + slug.split('?')[0];
-    console.log('Current free game:', title);
-    if (cfg.pg_timeLeft) await checkTimeLeft(url);
+    console.log('Current free game:', chalk.blue(title));
+    if (cfg.pg_timeLeft && await skipBasedOnTime(url)) continue;
     if (cfg.dryrun) continue;
     if (cfg.interactive && !await confirm()) continue;
     await (await card.$('.tw-button:has-text("Claim")')).click();
@@ -166,7 +168,7 @@ try {
     // console.log('Image:', img);
     await card.screenshot({ path: screenshot('internal', `${filenamify(title)}.png`) });
   }
-  console.log('Number of free unclaimed games (external stores):', external.length);
+  console.log('\nNumber of free unclaimed games (external stores):', external.length);
   // claim games in external/linked stores. Linked: origin.com, epicgames.com; Redeem-key: gog.com, legacygames.com, microsoft
   const external_info = [];
   for (const card of external) { // need to get data incl. URLs in this loop and then navigate in another, otherwise .all() would update after coming back and .elementHandles() like above would lead to error due to page navigation: elementHandle.$: Protocol error (Page.adoptNode)
@@ -178,13 +180,13 @@ try {
   }
   // external_info = [ { title: 'Fallout 76 (XBOX)', url: 'https://gaming.amazon.com/fallout-76-xbox-fgwp/dp/amzn1.pg.item.9fe17d7b-b6c2-4f58-b494-cc4e79528d0b?ingress=amzn&ref_=SM_Fallout76XBOX_S01_FGWP_CRWN' } ];
   for (const { title, url } of external_info) {
-    console.log('Current free game:', title); // , url);
+    console.log('Current free game:', chalk.blue(title)); // , url);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     if (cfg.debug) await page.pause();
     const item_text = await page.innerText('[data-a-target="DescriptionItemDetails"]');
     const store = item_text.toLowerCase().replace(/.* on /, '').slice(0, -1);
     console.log('  External store:', store);
-    if (cfg.pg_timeLeft) await checkTimeLeft(url);
+    if (cfg.pg_timeLeft && await skipBasedOnTime(url)) continue;
     if (cfg.dryrun) continue;
     if (cfg.interactive && !await confirm()) continue;
     await Promise.any([page.click('[data-a-target="buy-box"] .tw-button:has-text("Get game")'), page.click('[data-a-target="buy-box"] .tw-button:has-text("Claim")'), page.click('.tw-button:has-text("Complete Claim")'), page.waitForSelector('div:has-text("Link game account")'), page.waitForSelector('.thank-you-title:has-text("Success")')]); // waits for navigation
@@ -256,10 +258,14 @@ try {
               const r2 = page2.waitForResponse(r => r.request().method() == 'POST' && r.url().startsWith('https://redeem.gog.com/'));
               await page2.click('[type="submit"]'); // click Redeem
               const r2t = await (await r2).text();
+              const reason2 = JSON.parse(r2t).reason;
               if (r2t == '{}') {
                 redeem_action = 'redeemed';
                 console.log('  Redeemed successfully.');
                 db.data[user][title].status = 'claimed and redeemed';
+              } else if (reason2?.includes('captcha')) {
+                redeem_action = 'redeem (got captcha)';
+                console.error('  Got captcha; could not redeem!');
               } else {
                 console.debug(`  Response 2: ${r2t}`);
                 console.log('  Unknown Response 2 - please report in https://github.com/vogler/free-games-claimer/issues/5');
@@ -269,7 +275,7 @@ try {
             console.error(`  Redeem on ${store} is experimental!`);
             // await page2.pause();
             if (page2.url().startsWith('https://login.')) {
-              console.error('  Not logged in! Use the browser to login manually. Waiting for 60s.');
+              console.error('  Not logged in! Please redeem the code above manually. You can now login in the browser for next time. Waiting for 60s.');
               await page2.waitForTimeout(60 * 1000);
               redeem_action = 'redeem (login)';
             } else {
@@ -306,6 +312,7 @@ try {
               }
             }
           } else if (store == 'legacy games') {
+            // await page2.pause();
             await page2.fill('[name=coupon_code]', code);
             await page2.fill('[name=email]', cfg.lg_email);
             await page2.fill('[name=email_validate]', cfg.lg_email);
